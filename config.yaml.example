@@ -1,0 +1,60 @@
+# arXiv 论文日报配置文件模板
+# 复制此文件为 config.yaml 并填入您的实际信息
+
+# 大模型配置
+llm:
+  # API 地址 (支持 OpenAI API 格式的接口)
+  # OpenAI: https://api.openai.com/v1
+  # DeepSeek: https://api.deepseek.com/v1
+  # 智谱: https://open.bigmodel.cn/api/paas/v4
+  url: "https://api.openai.com/v1"
+  
+  # API Key (替换为您的 API Key)
+  api_key: "your-api-key-here"
+  
+  # 模型名称
+  # OpenAI: gpt-4o, gpt-4o-mini
+  # DeepSeek: deepseek-chat
+  # 智谱: glm-4
+  model: "gpt-4o"
+
+# arXiv 爬取配置
+arxiv:
+  # 论文分类 (可根据需要修改)
+  # hep-ph: High Energy Physics - Phenomenology (高能物理-唯象学)
+  # hep-ex: High Energy Physics - Experiment (高能物理-实验)
+  # hep-th: High Energy Physics - Theory (高能物理-理论)
+  # astro-ph: Astrophysics (天体物理)
+  # cond-mat: Condensed Matter (凝聚态物理)
+  categories:
+    - "hep-ph"
+    - "hep-ex"
+  
+  # 每个分类最大爬取数量
+  max_results: 100
+
+# 邮件配置 (QQ邮箱)
+email:
+  # 是否启用邮件发送
+  enabled: true
+  
+  # SMTP 服务器 (QQ邮箱)
+  smtp_server: "smtp.qq.com"
+  
+  # SMTP 端口 (SSL: 465)
+  smtp_port: 465
+  
+  # 发件人邮箱 (您的QQ邮箱)
+  sender: "your_qq@qq.com"
+  
+  # 授权码 (不是QQ密码！)
+  # 获取方式:
+  # 1. 登录 QQ邮箱网页版 (mail.qq.com)
+  # 2. 点击 设置 -> 账户
+  # 3. 找到 POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV服务
+  # 4. 开启 POP3/SMTP服务
+  # 5. 按提示发送短信验证，获取授权码
+  password: "your_authorization_code"
+  
+  # 收件人邮箱
+  receiver: "your_email@example.com"

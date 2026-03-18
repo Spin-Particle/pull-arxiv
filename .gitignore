@@ -1,0 +1,53 @@
+# 敏感配置文件（包含 API Key、邮箱授权码等）
+config.yaml
+
+# 输出文件
+output/
+
+# 日志文件
+*.log
+cron.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 图片文件
+*.png
+*.jpg
+*.jpeg
+*.gif
