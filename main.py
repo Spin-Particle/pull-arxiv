@@ -25,27 +25,43 @@ def get_beijing_date() -> str:
     return datetime.now(beijing_tz).strftime("%Y-%m-%d")
 
 
+def get_time_threshold_hours() -> int:
+    """
+    获取时间阈值
+    周一返回96小时（覆盖周末+周五），其他返回24小时
+    """
+    beijing_tz = timezone(timedelta(hours=8))
+    now_beijing = datetime.now(beijing_tz)
+    if now_beijing.weekday() == 0:  # 周一 (0=Monday)
+        print("今天是周一，扩大时间范围到96小时（覆盖周末）")
+        return 96
+    return 24
+
+
 def get_papers(categories: list, max_results: int = 100) -> list:
     """
     从 arXiv 获取指定分类的论文
     
+    使用 arXiv API 搜索，按时间阈值过滤论文。
+    周一获取最近72小时，其他日子获取最近24小时。
+
     Args:
         categories: 论文分类列表
         max_results: 每个分类最大结果数
-    
+
     Returns:
         论文列表
     """
     papers = []
-    seen_ids = set()  # 用于去重
-    beijing_tz = timezone(timedelta(hours=8))
+    seen_ids = set()
     
-    # 获取当前北京时间
+    beijing_tz = timezone(timedelta(hours=8))
     now_beijing = datetime.now(beijing_tz)
     today_beijing = now_beijing.date()
     
-    # 获取最近 24 小时的时间阈值（北京时间）
-    time_threshold = now_beijing - timedelta(hours=24)
+    # 获取时间阈值
+    time_threshold_hours = get_time_threshold_hours()
+    time_threshold = now_beijing - timedelta(hours=time_threshold_hours)
     
     for category in categories:
         print(f"正在获取 {category} 分类的论文...")
@@ -58,33 +74,40 @@ def get_papers(categories: list, max_results: int = 100) -> list:
             sort_order=arxiv.SortOrder.Descending
         )
         
-        for result in search.results():
-            # 论文发布时间转换为北京时间
-            published_beijing = result.published.astimezone(beijing_tz)
-            
-            # 只获取最近 24 小时内发布的论文
-            if published_beijing >= time_threshold:
-                # 去重：避免同一篇论文被多次添加
-                if result.entry_id not in seen_ids:
-                    seen_ids.add(result.entry_id)
-                    papers.append({
-                        "title": result.title,
-                        "authors": [author.name for author in result.authors],
-                        "summary": result.summary,
-                        "categories": result.categories,
-                        "pdf_url": result.pdf_url,
-                        "entry_id": result.entry_id,
-                        "published": published_beijing.strftime("%Y-%m-%d %H:%M:%S"),
-                        "primary_category": result.primary_category
-                    })
-                category_count += 1
-            else:
-                # 由于按时间降序排列，遇到旧论文即可停止
-                break
+        # 使用 Client.results() 方法获取结果
+        client = arxiv.Client()
+        
+        try:
+            for result in client.results(search):
+                # 使用更新时间（updated）而不是提交时间（published）
+                # 这样可以捕获那些在周四提交但在北京时间周五凌晨才公开的论文
+                updated_beijing = result.updated.astimezone(beijing_tz)
+                
+                # 只获取时间阈值内的论文
+                if updated_beijing >= time_threshold:
+                    # 去重：避免同一篇论文被多次添加
+                    if result.entry_id not in seen_ids:
+                        seen_ids.add(result.entry_id)
+                        papers.append({
+                            "title": result.title,
+                            "authors": [author.name for author in result.authors],
+                            "summary": result.summary,
+                            "categories": result.categories,
+                            "pdf_url": result.pdf_url,
+                            "entry_id": result.entry_id,
+                            "published": updated_beijing.strftime("%Y-%m-%d %H:%M:%S"),
+                            "primary_category": result.primary_category
+                        })
+                        category_count += 1
+                else:
+                    # 由于按时间降序排列，遇到旧论文即可停止
+                    break
+        except Exception as e:
+            print(f"  获取失败: {e}")
         
         print(f"  {category}: {category_count} 篇")
-    
-    print(f"共获取到 {len(papers)} 篇论文（最近24小时，北京时间日期: {today_beijing.strftime('%Y-%m-%d')}）")
+
+    print(f"共获取到 {len(papers)} 篇论文（最近{time_threshold_hours}小时，北京时间日期: {today_beijing.strftime('%Y-%m-%d')}）")
     return papers
 
 
@@ -193,7 +216,7 @@ def main():
     )
     
     if not papers:
-        print("今天没有新的论文更新")
+        print("没有新的论文更新")
         # 生成空报告
         md_content = f"""# arXiv 论文日报 - {date}
 

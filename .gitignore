@@ -45,6 +45,7 @@ env/
 .DS_Store
 .AppleDouble
 .LSOverride
+.opencode
 
 # 图片文件
 *.png
