@@ -5,12 +5,15 @@ arXiv 论文日报 - 主脚本
 """
 
 import os
+import re
 import sys
 import yaml
 import arxiv
 from datetime import datetime, timezone, timedelta
 from openai import OpenAI
 from pathlib import Path
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -25,29 +28,60 @@ def get_beijing_date() -> str:
     return datetime.now(beijing_tz).strftime("%Y-%m-%d")
 
 
-def get_time_threshold_hours() -> int:
+def fetch_paper_ids_from_listing(category: str) -> tuple:
     """
-    获取时间阈值
-    周一返回96小时（覆盖周末+周五），其他返回24小时
+    从 arXiv listing 页面获取当天新论文的 ID 列表
+    
+    通过抓取 https://arxiv.org/list/{category}/new 页面，
+    精确获取当天 arXiv 更新批次中的论文，避免基于时间窗口过滤造成的遗漏。
+    
+    Args:
+        category: 论文分类 (如 'hep-ph')
+    
+    Returns:
+        (new_submission_ids, cross_list_ids) 元组，分别为新提交和交叉列表的论文ID列表
     """
-    beijing_tz = timezone(timedelta(hours=8))
-    now_beijing = datetime.now(beijing_tz)
-    if now_beijing.weekday() == 0:  # 周一 (0=Monday)
-        print("今天是周一，扩大时间范围到96小时（覆盖周末）")
-        return 96
-    return 24
+    url = f"https://arxiv.org/list/{category}/new"
+    
+    try:
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; arxiv-daily-bot/1.0)'})
+        with urlopen(req, timeout=30) as response:
+            html = response.read().decode('utf-8')
+    except (URLError, HTTPError) as e:
+        print(f"  获取 listing 页面失败: {e}")
+        return [], []
+    
+    new_ids = []
+    cross_ids = []
+    
+    # 按 <h3> 标签分割页面内容为不同区段
+    sections = re.split(r'<h3>', html)
+    
+    for section in sections:
+        # 匹配 "New submissions" 区段
+        if re.match(r'\s*New submissions', section):
+            ids = re.findall(r'arXiv:(\d+\.\d+)', section)
+            new_ids.extend(ids)
+        # 匹配 "Cross submissions" 区段（交叉列表）
+        elif re.match(r'\s*Cross submissions', section):
+            ids = re.findall(r'arXiv:(\d+\.\d+)', section)
+            cross_ids.extend(ids)
+        # "Replacements" 区段不处理（已存在的论文更新版本）
+    
+    return new_ids, cross_ids
 
 
 def get_papers(categories: list, max_results: int = 100) -> list:
     """
     从 arXiv 获取指定分类的论文
     
-    使用 arXiv API 搜索，按时间阈值过滤论文。
-    周一获取最近72小时，其他日子获取最近24小时。
+    通过抓取 arXiv listing 页面（/list/{category}/new）获取当天更新批次的论文 ID，
+    再通过 arXiv API 获取论文详细信息。
+    这种方式精确匹配 arXiv 每日发布的更新批次，不会因时间窗口估算偏差而遗漏论文。
 
     Args:
         categories: 论文分类列表
-        max_results: 每个分类最大结果数
+        max_results: 每个分类最大结果数（用于 API 回退模式）
 
     Returns:
         论文列表
@@ -56,58 +90,76 @@ def get_papers(categories: list, max_results: int = 100) -> list:
     seen_ids = set()
     
     beijing_tz = timezone(timedelta(hours=8))
-    now_beijing = datetime.now(beijing_tz)
-    today_beijing = now_beijing.date()
     
-    # 获取时间阈值
-    time_threshold_hours = get_time_threshold_hours()
-    time_threshold = now_beijing - timedelta(hours=time_threshold_hours)
+    # 收集所有分类的论文 ID
+    all_paper_ids = []
     
     for category in categories:
         print(f"正在获取 {category} 分类的论文...")
-        category_count = 0
         
-        search = arxiv.Search(
-            query=f"cat:{category}",
-            max_results=max_results,
-            sort_by=arxiv.SortCriterion.SubmittedDate,
-            sort_order=arxiv.SortOrder.Descending
-        )
+        # 从 listing 页面获取当天新论文 ID
+        new_ids, cross_ids = fetch_paper_ids_from_listing(category)
         
-        # 使用 Client.results() 方法获取结果
-        client = arxiv.Client()
+        if not new_ids and not cross_ids:
+            print(f"  {category}: listing 页面未找到新论文")
+            continue
+        
+        print(f"  {category}: 新提交 {len(new_ids)} 篇, 交叉列表 {len(cross_ids)} 篇")
+        
+        # 合并新提交和交叉列表的论文 ID
+        category_ids = new_ids + cross_ids
+        
+        # 去重（同一论文可能出现在多个分类的交叉列表中）
+        unique_ids = [pid for pid in category_ids if pid not in seen_ids]
+        for pid in unique_ids:
+            seen_ids.add(pid)
+        
+        all_paper_ids.extend([(pid, category) for pid in unique_ids])
+    
+    if not all_paper_ids:
+        print("未获取到任何论文 ID")
+        return papers
+    
+    # 通过 arXiv API 批量获取论文详细信息
+    print(f"正在通过 API 获取 {len(all_paper_ids)} 篇论文的详细信息...")
+    
+    # 提取所有去重后的 ID
+    unique_paper_ids = list(dict.fromkeys(pid for pid, _ in all_paper_ids))
+    
+    client = arxiv.Client()
+    
+    # 分批获取（arXiv API 可能对单次请求的 ID 数量有限制）
+    batch_size = 50
+    seen_entry_ids = set()
+    
+    for i in range(0, len(unique_paper_ids), batch_size):
+        batch = unique_paper_ids[i:i + batch_size]
         
         try:
+            search = arxiv.Search(
+                id_list=batch,
+                max_results=len(batch)
+            )
+            
             for result in client.results(search):
-                # 使用更新时间（updated）而不是提交时间（published）
-                # 这样可以捕获那些在周四提交但在北京时间周五凌晨才公开的论文
-                updated_beijing = result.updated.astimezone(beijing_tz)
-                
-                # 只获取时间阈值内的论文
-                if updated_beijing >= time_threshold:
-                    # 去重：避免同一篇论文被多次添加
-                    if result.entry_id not in seen_ids:
-                        seen_ids.add(result.entry_id)
-                        papers.append({
-                            "title": result.title,
-                            "authors": [author.name for author in result.authors],
-                            "summary": result.summary,
-                            "categories": result.categories,
-                            "pdf_url": result.pdf_url,
-                            "entry_id": result.entry_id,
-                            "published": updated_beijing.strftime("%Y-%m-%d %H:%M:%S"),
-                            "primary_category": result.primary_category
-                        })
-                        category_count += 1
-                else:
-                    # 由于按时间降序排列，遇到旧论文即可停止
-                    break
+                if result.entry_id not in seen_entry_ids:
+                    seen_entry_ids.add(result.entry_id)
+                    updated_beijing = result.updated.astimezone(beijing_tz)
+                    papers.append({
+                        "title": result.title,
+                        "authors": [author.name for author in result.authors],
+                        "summary": result.summary,
+                        "categories": result.categories,
+                        "pdf_url": result.pdf_url,
+                        "entry_id": result.entry_id,
+                        "published": updated_beijing.strftime("%Y-%m-%d %H:%M:%S"),
+                        "primary_category": result.primary_category
+                    })
         except Exception as e:
-            print(f"  获取失败: {e}")
-        
-        print(f"  {category}: {category_count} 篇")
-
-    print(f"共获取到 {len(papers)} 篇论文（最近{time_threshold_hours}小时，北京时间日期: {today_beijing.strftime('%Y-%m-%d')}）")
+            print(f"  批量获取论文详情失败 (批次 {i // batch_size + 1}): {e}")
+    
+    beijing_date = datetime.now(beijing_tz).strftime("%Y-%m-%d")
+    print(f"共获取到 {len(papers)} 篇论文 (日期: {beijing_date})")
     return papers
 
 
