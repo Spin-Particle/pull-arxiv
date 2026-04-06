@@ -70,7 +70,8 @@ def get_qcdsr_papers(max_results: int = 50) -> list:
         sort_order=arxiv.SortOrder.Descending
     )
     
-    for result in search.results():
+    client = arxiv.Client()
+    for result in client.results(search):
         # 论文发布时间转换为北京时间
         published_beijing = result.published.astimezone(beijing_tz)
         
