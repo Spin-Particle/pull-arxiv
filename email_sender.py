@@ -5,11 +5,16 @@
 """
 
 import smtplib
+import re
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 from email.header import Header
 from email.utils import formataddr
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
 import yaml
 from pathlib import Path
 
@@ -21,10 +26,73 @@ def load_email_config(config_path: str = "config.yaml") -> dict:
     return config.get("email", {})
 
 
+def clean_latex(text: str) -> str:
+    """清理 LaTeX 公式，转为可读纯文本"""
+    # 处理行间公式 $$...$$
+    text = re.sub(r'\$\$(.+?)\$\$', r'[\1]', text, flags=re.DOTALL)
+    # 处理行内公式 $...$
+    text = re.sub(r'\$(.+?)\$', r'[\1]', text)
+    # 处理 \textsc{...} 等命令
+    text = re.sub(r'\\textsc\{(.+?)\}', r'\1', text)
+    text = re.sub(r'\\mathrm\{(.+?)\}', r'\1', text)
+    text = re.sub(r'\\rm\{(.+?)\}', r'\1', text)
+    text = re.sub(r'\\overline\{(.+?)\}', r'\1-bar', text)
+    text = re.sub(r'\\bar\{(.+?)\}', r'\1-bar', text)
+    text = re.sub(r'\\frac\{(.+?)\}\{(.+?)\}', r'\1/\2', text)
+    text = re.sub(r'\\sqrt\{(.+?)\}', r'sqrt(\1)', text)
+    text = re.sub(r'\\mathcal\{(.+?)\}', r'\1', text)
+    text = re.sub(r'\\mathbb\{(.+?)\}', r'\1', text)
+    text = re.sub(r'\\left\\?', '', text)
+    text = re.sub(r'\\right\\?', '', text)
+    # 清理常见 LaTeX 命令
+    text = text.replace('\\bar{', '')
+    text = text.replace('\\hat{', '')
+    text = text.replace('\\tilde{', '')
+    text = text.replace('\\vec{', '')
+    text = re.sub(r'\\[a-zA-Z]+', '', text)  # 移除剩余 LaTeX 命令
+    # 清理残留的花括号
+    text = re.sub(r'[{}]', '', text)
+    return text
+
+
+def markdown_to_plain_text(markdown_content: str) -> str:
+    """将 Markdown 转为干净的纯文本，用于降级发送"""
+    text = markdown_content
+    # 清理 LaTeX 公式
+    text = clean_latex(text)
+    # 移除 Markdown 链接，只保留文本和 URL
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1 (\2)', text)
+    # 移除粗体标记
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    # 移除斜体标记
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    # 移除引用标记
+    text = re.sub(r'^> ', '  ', text, flags=re.MULTILINE)
+    # 保留标题标记和分隔线
+    return text
+
+
+def _build_smtp_message(subject: str, config: dict) -> MIMEMultipart:
+    """创建基础邮件消息（不含正文）"""
+    message = MIMEMultipart()
+    # 注意：From 显示名称不能包含 "arXiv" 等知名机构名，否则会触发 QQ 邮箱反伪装/反钓鱼策略
+    message['From'] = formataddr(('论文日报推送', config['sender']))
+    message['To'] = formataddr(('收件人', config['receiver']))
+    message['Subject'] = Header(subject, 'utf-8')
+    return message
+
+
+def _smtp_send(config: dict, message: MIMEMultipart) -> bool:
+    """通过 SMTP 发送邮件"""
+    smtp = smtplib.SMTP_SSL(config['smtp_server'], config['smtp_port'])
+    smtp.login(config['sender'], config['password'])
+    smtp.sendmail(config['sender'], [config['receiver']], message.as_string())
+    smtp.quit()
+    return True
+
+
 def markdown_to_html(markdown_content: str) -> str:
     """将 Markdown 内容简单转换为 HTML"""
-    import re
-    
     html = markdown_content
     
     # 转换标题
@@ -91,10 +159,12 @@ def markdown_to_html(markdown_content: str) -> str:
             color: #2c3e50;
             border-bottom: 2px solid #3498db;
             padding-bottom: 10px;
+            font-size: 1.5em;
         }}
         h2 {{
             color: #34495e;
             margin-top: 30px;
+            font-size: 1.17em;
         }}
         h3 {{
             color: #7f8c8d;
@@ -134,9 +204,20 @@ def markdown_to_html(markdown_content: str) -> str:
     return html_template
 
 
+def _is_content_rejected_error(e: Exception) -> bool:
+    """判断是否为内容被拒绝的错误（550 inappropriate content）"""
+    error_str = str(e)
+    return '550' in error_str and 'inappropriate' in error_str.lower()
+
+
 def send_email(subject: str, content: str, content_type: str = "html") -> bool:
     """
-    发送邮件
+    发送邮件，带自动降级策略
+    
+    策略：
+    1. 尝试 HTML 格式发送
+    2. 若因内容被拒(550)，降级为纯文本重试
+    3. 若纯文本也被拒，降级为附件方式发送
     
     Args:
         subject: 邮件主题
@@ -152,32 +233,65 @@ def send_email(subject: str, content: str, content_type: str = "html") -> bool:
         print("邮件发送未启用")
         return False
     
+    # ========== 第一次尝试：原始方式发送 ==========
     try:
-        # 创建邮件
-        message = MIMEMultipart()
-        # 使用 formataddr 设置标准格式的邮件头
-        message['From'] = formataddr(('arXiv论文日报', config['sender']))
-        message['To'] = formataddr(('收件人', config['receiver']))
-        message['Subject'] = Header(subject, 'utf-8')
-        
-        # 添加内容
+        message = _build_smtp_message(subject, config)
         if content_type == "html":
             msg_content = MIMEText(content, 'html', 'utf-8')
         else:
             msg_content = MIMEText(content, 'plain', 'utf-8')
         message.attach(msg_content)
-        
-        # 发送邮件
-        smtp = smtplib.SMTP_SSL(config['smtp_server'], config['smtp_port'])
-        smtp.login(config['sender'], config['password'])
-        smtp.sendmail(config['sender'], [config['receiver']], message.as_string())
-        smtp.quit()
-        
+        _smtp_send(config, message)
         print(f"邮件发送成功: {subject}")
         return True
-        
     except Exception as e:
-        print(f"邮件发送失败: {e}")
+        if not _is_content_rejected_error(e):
+            print(f"邮件发送失败: {e}")
+            return False
+        print(f"HTML 发送被拒绝(550)，尝试纯文本降级发送...")
+    
+    # ========== 第二次尝试：纯文本降级 ==========
+    time.sleep(2)
+    try:
+        plain_content = markdown_to_plain_text(content)
+        message = _build_smtp_message(subject, config)
+        msg_content = MIMEText(plain_content, 'plain', 'utf-8')
+        message.attach(msg_content)
+        _smtp_send(config, message)
+        print(f"邮件发送成功（纯文本降级）: {subject}")
+        return True
+    except Exception as e:
+        if not _is_content_rejected_error(e):
+            print(f"邮件发送失败: {e}")
+            return False
+        print(f"纯文本发送也被拒绝(550)，尝试附件方式发送...")
+    
+    # ========== 第三次尝试：作为 HTML 附件发送 ==========
+    time.sleep(2)
+    try:
+        message = _build_smtp_message(subject, config)
+        # 简短正文
+        body_text = subject + "\n\n完整报告见附件。"
+        msg_content = MIMEText(body_text, 'plain', 'utf-8')
+        message.attach(msg_content)
+        
+        # HTML 作为附件
+        html_bytes = content.encode('utf-8')
+        attachment = MIMEBase('text', 'html')
+        attachment.set_payload(html_bytes)
+        encoders.encode_base64(attachment)
+        safe_subject = re.sub(r'[^\w\s-]', '', subject)
+        attachment.add_header(
+            'Content-Disposition', 'attachment',
+            filename=f"{safe_subject}.html"
+        )
+        message.attach(attachment)
+        
+        _smtp_send(config, message)
+        print(f"邮件发送成功（附件方式）: {subject}")
+        return True
+    except Exception as e:
+        print(f"邮件发送失败（所有方式均失败）: {e}")
         return False
 
 
